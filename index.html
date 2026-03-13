@@ -402,7 +402,7 @@ let cfg = {
   header: 'X-API-Key',
   interval: 300,
   path: '',
-  fm: { name:'stationName', frc:'value.frc_2', lat:'latitude', lon:'longtitude', area:'stationCode', branch:'stationNameEn' }
+  fm: { name:'stationName', frc:'value.frc_2', turb:'value.tub_1', lat:'latitude', lon:'longtitude', area:'stationCode', branch:'stationNameEn' }
 };
 
 function loadCfg() {
@@ -498,37 +498,63 @@ function normalizeStation(raw) {
   const lon = parseFloat(getNestedValue(raw, fm.lon));
   if(isNaN(frc)||isNaN(lat)||isNaN(lon)) return null;
   const name = String(getNestedValue(raw, fm.name) || '').replace(/\n/g,' ').trim();
+  const turb = parseFloat(getNestedValue(raw, fm.turb));
   // Auto-detect station type
   let type='monitor';
   if(/โรงงานผลิต|โรงงาน/.test(name)) type='plant';
   else if(/สถานีสูบส่ง|สถานีสูบจ่าย|สถานีสูบ/.test(name)) type='pump';
   return {
     name, frc, lat, lon, type,
+    turb: isNaN(turb) ? null : turb,
     area:   String(getNestedValue(raw, fm.area)   || ''),
     branch: String(getNestedValue(raw, fm.branch) || ''),
   };
 }
 
-// CORS proxy list — ลองตามลำดับจนสำเร็จ
+// CORS proxy list — index 0 = direct
 const CORS_PROXIES = [
-  url => url,                                          // 1) direct (ถ้า server รองรับ CORS)
+  url => url,
   url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
   url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  url => `https://proxy.cors.sh/${url}`,
+  url => `https://cors.eu.org/${url}`,
+  url => `https://thingproxy.freeboard.io/fetch/${url}`,
+  url => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
 ];
 
-async function tryFetch(url, opts) {
-  for(let i=0; i<CORS_PROXIES.length; i++) {
-    const proxyUrl = CORS_PROXIES[i](url);
-    try {
-      const res = await fetch(proxyUrl, { ...opts, signal: AbortSignal.timeout(15000) });
-      if(res.ok) return { res, proxyIndex: i };
-      if(i === CORS_PROXIES.length-1) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-    } catch(e) {
-      if(i === CORS_PROXIES.length-1) throw e;
-      // CORS หรือ network error → ลอง proxy ถัดไป
-      console.warn(`Proxy ${i} failed, trying next...`, e.message);
-    }
+let _fastProxy = 0;
+
+function tryFetch(url, opts) {
+  function one(pf, ms) {
+    const c = new AbortController();
+    const timer = setTimeout(() => c.abort(), ms);
+    const pu = pf(url);
+    return {
+      ctrl: c,
+      promise: fetch(pu, {...opts, signal: c.signal})
+        .then(r => { if(!r.ok) throw new Error('HTTP '+r.status); clearTimeout(timer); return {res:r, pi:CORS_PROXIES.indexOf(pf)}; })
+        .catch(e => { clearTimeout(timer); return Promise.reject(e); })
+    };
   }
+  function race(idx, ms) {
+    const en = idx.map(i => { const e=one(CORS_PROXIES[i],ms); e.i=i; return e; });
+    return new Promise((res,rej) => {
+      let d=0;
+      en.forEach(e => {
+        e.promise
+          .then(r => { en.forEach(x => { if(x!==e) x.ctrl.abort(); }); res({res:r.res, pi:e.i}); })
+          .catch(() => { if(++d===en.length) rej(new Error('ไม่สามารถเชื่อมต่อ API ได้ — ตรวจสอบ URL หรือเครือข่าย')); });
+      });
+    });
+  }
+  // wave1: direct + proxy ที่เคยเร็ว
+  const w1 = [...new Set([0, _fastProxy])];
+  return race(w1, 6000)
+    .then(r => { _fastProxy=r.pi; return r; })
+    .catch(() => {
+      const w2 = CORS_PROXIES.map((_,i)=>i).filter(i=>!w1.includes(i));
+      return race(w2, 10000).then(r => { _fastProxy=r.pi; return r; });
+    });
 }
 
 async function fetchData() {
@@ -536,7 +562,7 @@ async function fetchData() {
   setDotState('loading');
   try {
     const target = buildUrl();
-    const { res, proxyIndex } = await tryFetch(target, { headers: buildHeaders() });
+    const { res, pi: proxyIndex } = await tryFetch(target, { headers: buildHeaders() });
     const json = await res.json();
     const arr  = getNestedValue(json, cfg.path);
     if(!Array.isArray(arr)) throw new Error('Response ไม่ใช่ array — ตรวจสอบ Array path');
@@ -544,6 +570,9 @@ async function fetchData() {
     if(!stations.length) throw new Error('ไม่พบข้อมูลสถานีในผลลัพธ์');
 
     SENSORS = stations;
+    // อัปเดต SENSORS_TURB จากข้อมูล live (เฉพาะสถานีที่มีค่า turb จริง)
+    const withTurb = stations.filter(s => s.turb !== null);
+    if(withTurb.length > 0) SENSORS_TURB = withTurb;
     setDotState('live');
     const now = new Date();
     const proxyLabel = proxyIndex === 0 ? 'LIVE API' : `LIVE (proxy ${proxyIndex})`;
@@ -671,12 +700,13 @@ const TURB_OK=0.5, TURB_WARN=4.0;
 function turbStatusColor(t){ return t<=TURB_OK?'#8b7355':t<=TURB_WARN?'#8b4513':'#5c1f00'; }
 function turbStatusText(t){  return t<=TURB_OK?'✓ ใส (≤0.5 NTU)':t<=TURB_WARN?'⚠ ขุ่นปานกลาง':'🔴 ขุ่นมาก (>4 NTU)'; }
 function idwTurb(lat,lon,pw=1.8){
-  const src = SENSORS_TURB.length ? SENSORS_TURB : FALLBACK_TURB;
+  const src = SENSORS.length ? SENSORS : FALLBACK_TURB;
   let ws=0,vs=0;
   for(const s of src){
     const d=Math.sqrt((s.lat-lat)**2+(s.lon-lon)**2);
-    if(d<1e-8) return s.turb;
-    const w=1/Math.pow(d,pw); ws+=w; vs+=w*s.turb;
+    const tv = getTurbValue(s);
+    if(d<1e-8) return tv;
+    const w=1/Math.pow(d,pw); ws+=w; vs+=w*tv;
   }
   return vs/ws;
 }
@@ -995,15 +1025,24 @@ for(const p of MWA_POLYS){
 }
 
 const sensorGroup=L.layerGroup().addTo(map);
+
+// สร้าง lookup turb จาก name เพื่อ match ถูกต้อง
+function getTurbValue(s) {
+  if(SENSORS_TURB.length) {
+    const match = SENSORS_TURB.find(t => t.name === s.name);
+    if(match && match.turb !== null) return match.turb;
+  }
+  const fb = FALLBACK_TURB.find(t => t.name === s.name);
+  return fb ? fb.turb : 1.0;
+}
+
 function buildMarkers(){
   sensorGroup.clearLayers();
   if(!layers.sensors) return;
   const isTurb = PARAM==='turb';
-  const turbSrc = SENSORS_TURB.length ? SENSORS_TURB : FALLBACK_TURB;
   for(let i=0;i<SENSORS.length;i++){
     const s = SENSORS[i];
-    const ts = turbSrc[i] || {...s, turb: 1.0};
-    const val   = isTurb ? (ts.turb ?? 1.0) : s.frc;
+    const val   = isTurb ? getTurbValue(s) : s.frc;
     const c     = isTurb ? turbStatusColor(val) : statusColor(val);
     const unit  = isTurb ? 'NTU' : 'mg/L';
     const stTxt = isTurb ? turbStatusText(val) : statusText(val);
@@ -1117,8 +1156,8 @@ function renderTab(){
   const turbSrc = SENSORS_TURB.length ? SENSORS_TURB : FALLBACK_TURB;
   if(activeTab==='alert'){
     if(isTurb){
-      const sorted = turbSrc.slice(0,SENSORS.length)
-        .map((ts,i)=>({...SENSORS[i], turb: ts.turb??1.0}))
+      const sorted = SENSORS
+        .map(s=>({...s, turb: getTurbValue(s)}))
         .filter(s=>s.turb>TURB_OK).sort((a,b)=>b.turb-a.turb);
       if(!sorted.length){el.innerHTML='<div style="font-size:12px;color:#8b7355;text-align:center;padding:20px 0;">✓ ทุกสถานีน้ำใส</div>';return;}
       el.innerHTML=sorted.map(s=>`<div class="alert-item ${s.turb>TURB_WARN?'':'warn'}" onclick="flyTo(${s.lat},${s.lon})">
